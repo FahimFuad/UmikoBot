@@ -27,7 +27,6 @@ using namespace Discord;
 
 CurrencyModule::CurrencyModule(UmikoBot* client) : Module("currency", true), m_client(client)
 {
-
 	m_timer.setInterval(24*60*60*1000); //!24hr timer
 	QObject::connect(&m_timer, &QTimer::timeout, [this, client]() 
 		{
@@ -87,6 +86,103 @@ CurrencyModule::CurrencyModule(UmikoBot* client) : Module("currency", true), m_c
 	});
 
 	m_timer.start();
+
+	auto holidaySpecialCheck = [this]()
+	{
+		// Y/M/D but we ignore the year (set to 1 because 0 is invalid)
+		QList<QDate> specialDates = { QDate { 1, 12, 25 }, QDate { 1, 1, 1 } };
+		QDate currentDate = QDate::currentDate();
+		bool isHoliday = false;
+
+		for (const QDate& date : specialDates)
+		{
+			if (date.month() == currentDate.month() && date.day() == currentDate.day())
+			{
+				isHoliday = true;
+				break;
+			}
+		}
+
+		if (isHoliday)
+		{
+			if (!isHolidaySpecialActive)
+			{
+				for (snowflake_t guild : serverCurrencyConfig.keys())
+				{
+					snowflake_t channel = serverCurrencyConfig[guild].giveawayChannelId;
+					QString emoji = utility::consts::emojis::GIFT;
+					UmikoBot::Instance().createMessage(channel, emoji + " **A holiday special is now occurring!** " + emoji + "\nLook out for gifts during the day!");
+				}
+
+				isHolidaySpecialActive = true;
+				int numberOfMinutes = (qrand() % 30) + 15; // 15 - 45 after start
+				holidaySpecialTimer.setInterval(numberOfMinutes * 60 * 1000);
+				holidaySpecialTimer.start();
+			}
+		}
+		else
+		{
+			if (isHolidaySpecialActive)
+			{
+				for (snowflake_t guild : serverCurrencyConfig.keys())
+				{
+					snowflake_t channel = serverCurrencyConfig[guild].giveawayChannelId;
+					UmikoBot::Instance().createMessage(channel, "**The holiday special has ended!**\nBe sure to grab your gifts next time!");
+				}
+
+				isHolidaySpecialActive = false;
+				isHolidaySpecialClaimable = false;
+				holidaySpecialTimer.stop();
+			}
+		}
+	};
+
+	holidaySpecialCheckTimer.setInterval(1 * 60 * 60 * 1000); // Hourly timer
+	QObject::connect(&holidaySpecialCheckTimer, &QTimer::timeout, holidaySpecialCheck);
+	holidaySpecialCheckTimer.start();
+
+	QObject::connect(&holidaySpecialTimer, &QTimer::timeout, [this, client]()
+	{
+		if (!isHolidaySpecialActive)
+		{
+			isHolidaySpecialClaimable = false;
+			holidaySpecialTimer.stop();
+			return;
+		}
+
+		if (isHolidaySpecialClaimable)
+		{
+			isHolidaySpecialClaimable = false;
+			int numberOfMinutes = (qrand() % 40) + 40; // 40 - 80 minutes later
+			holidaySpecialTimer.setInterval(numberOfMinutes * 60 * 1000);
+
+			for (snowflake_t guild : serverCurrencyConfig.keys())
+			{
+				snowflake_t channel = serverCurrencyConfig[guild].giveawayChannelId;
+				UmikoBot::Instance().createMessage(channel, "**The holiday gift window has closed!**\nThere may be another one soon...");;
+			}
+		}
+		else
+		{
+			isHolidaySpecialClaimable = true;
+			int numberOfMinutes = 5;
+			holidaySpecialTimer.setInterval(numberOfMinutes * 60 * 1000);
+
+			for (snowflake_t guild : serverCurrencyConfig.keys())
+			{
+				// Resets everyone's claimed flag
+				for (UserCurrency& userCurrency : guildList[guild])
+				{
+					userCurrency.hasClaimedCurrentGift = false;
+				}
+
+				snowflake_t channel = serverCurrencyConfig[guild].giveawayChannelId;
+				QString emoji = utility::consts::emojis::GIFT;
+				QString msg = emoji + " **Holiday gift window is now open!** " + emoji + "\nGet your `!gift` within the next " + QString::number(numberOfMinutes) + " minutes!";
+				UmikoBot::Instance().createMessage(channel, msg);
+			}
+		}
+	});
 
 	RegisterCommand(Commands::CURRENCY_WALLET, "wallet", [this](Client& client, const Message& message, const Channel& channel) 
 	{
@@ -447,6 +543,56 @@ CurrencyModule::CurrencyModule(UmikoBot* client) : Module("currency", true), m_c
 
 	});
 
+	RegisterCommand(Commands::CURRENCY_GIFT, "gift", [this](Client& client, const Message& message, const Channel& channel)
+	{
+		QStringList args = message.content().split(' ');
+
+		if (args.size() > 1)
+		{
+			client.createMessage(message.channelId(), "**Wrong Usage of Command!** ");
+			return;
+		}
+
+		if (!isHolidaySpecialActive)
+		{
+			client.createMessage(message.channelId(), "**Today is not a special day!**\nWait for one to arrive before looking for gifts.");
+			return;
+		}
+
+		if (!isHolidaySpecialClaimable)
+		{
+			client.createMessage(message.channelId(), "**There is no gift available at the moment!**");
+			return;
+		}
+
+		int jailRemainingTime = guildList[channel.guildId()][getUserIndex(channel.guildId(), message.author().id())].jailTimer->remainingTime();
+		if (jailRemainingTime > 0)
+		{
+			QString time = utility::StringifyMilliseconds(jailRemainingTime);
+			QString desc = "**You are in jail!**\nYou can't receive gifts for another " + time;
+			client.createMessage(message.channelId(), desc);
+			return;
+		}
+
+		auto& userCurrency = getUserData(channel.guildId(), message.author().id());
+		if (userCurrency.hasClaimedCurrentGift)
+		{
+			client.createMessage(message.channelId(), "**You have already claimed this gift!**\nDon't bother me until the next one...");
+			return;
+		}
+
+		int amountReceived = (qrand() % 6) + 20;
+		userCurrency.setCurrency(userCurrency.currency() + amountReceived);
+		userCurrency.hasClaimedCurrentGift = true;
+
+		QString name = UmikoBot::Instance().GetName(channel.guildId(), message.author().id());
+		QString amountString = QString::number(amountReceived);
+		QString currencySymbol = getServerData(channel.guildId()).currencySymbol;
+		QString emoji = utility::consts::emojis::GIFT_HEART;
+		QString msg = emoji + " **Congratulations!** " + emoji + "\n" + name + " has been gifted `" + amountString + " " + currencySymbol + "`";
+		client.createMessage(message.channelId(), msg);
+	});
+
 	RegisterCommand(Commands::CURRENCY_SET_PRIZE_CHANNEL, "setannouncechan", [this](Client& client, const Message& message, const Channel& channel) 
 	{
 		QStringList args = message.content().split(' ');
@@ -582,61 +728,99 @@ CurrencyModule::CurrencyModule(UmikoBot* client) : Module("currency", true), m_c
 	RegisterCommand(Commands::CURRENCY_RICH_LIST, "richlist", [this](Client& client, const Message& message, const Channel& channel) 
 	{
 		QStringList args = message.content().split(' ');
+		unsigned int min;
+		unsigned int max;
 
-		if (args.size() > 1) 
+		if (args.size() == 1)
+		{
+			min = 1;
+			max = 30;
+		}
+		else if (args.size() == 2)
+		{
+			min = 1;
+			max = args[1].toUInt();
+
+			if (max == 0)
+			{
+				client.createMessage(message.channelId(), "**Your argument must be an integer greater than 0**");
+				return;
+			}
+		}
+		else if (args.size() == 3)
+		{
+			min = args[1].toUInt();
+			max = args[2].toUInt();
+
+			if (min == 0 || max == 0)
+			{
+				client.createMessage(message.channelId(), "**Your arguments must be integers greater than 0**");
+				return;
+			}
+		}
+		else
 		{
 			client.createMessage(message.channelId(), "**Wrong Usage of Command!** ");
 			return;
 		}
-		else 
+
+		auto& leaderboard = guildList[channel.guildId()];
+
+		if (min > leaderboard.size())
 		{
-			//! Print the top 30 (or less depending on number of 
-			//! members) people in the leaderboard
+			client.createMessage(message.channelId(), "**Not enough members to create the list.**");
+			return;
+		}
+		if (max > leaderboard.size())
+		{
+			max = leaderboard.size();
+		}
+		if (min > max)
+		{
+			client.createMessage(message.channelId(), "**The upper bound must be greater than the lower bound.**");
+			return;
+		}
 
-			auto& leaderboard = guildList[channel.guildId()];
+		qSort(leaderboard.begin(), leaderboard.end(), [](const UserCurrency& u1, const UserCurrency& u2)
+		{
+			return u1.currency() > u2.currency();
+		});
 
-			int offset{ 30 };
-			if (leaderboard.size() < 30) 
-				{
-					offset = leaderboard.size();
-				}
+		QString desc;
+		Embed embed;
+		embed.setTitle("Currency Leaderboard (From " + QString::number(min) + " To " + QString::number(max) + ")");
+		int numberOfDigits = QString::number(max).size();
 
-			qSort(leaderboard.begin(), leaderboard.end(), [](UserCurrency u1, UserCurrency u2)
-					{
-						return u1.currency() > u2.currency();
-					});
+		unsigned int rank = min;
 
-			Embed embed;
-			embed.setTitle("Currency Leaderboard (Top 30)");
-			QString desc;
-			int rank = 0;
-			int numberOfDigits = QString::number(offset).size();
+		for (unsigned int i = min; i <= max; i++)
+		{
+			auto& user = leaderboard[i - 1]; // `i` is one-based, not zero-based
+			QString username = UmikoBot::Instance().GetName(channel.guildId(), user.userId);
 
-			for (auto i = 0; i < offset && i < leaderboard.size(); i++) 
+			if (username.isEmpty())
 			{
-				const auto& user = leaderboard[i];
-				QString username = UmikoBot::Instance().GetName(channel.guildId(), user.userId);
-
-				if (username == "") 
+				max += 1;
+				if (max > leaderboard.size())
 				{
-					offset++;
-					continue;
+					max = leaderboard.size();
 				}
 
-				rank++;
-
-				QString currency = QString::number((double)user.currency());
-
-				desc += "`" + QString::number(rank).rightJustified(numberOfDigits, ' ') + "`) **" + username + "** - ";
-				desc += currency + " " + getServerData(channel.guildId()).currencySymbol + "\n";
+				continue;
 			}
 
-			embed.setColor(qrand() % 16777216);
-			embed.setDescription(desc);
+			QString currency = QString::number((double) user.currency());
 
-			client.createMessage(message.channelId(), embed);
+			desc += "`" + QString::number(rank).rightJustified(numberOfDigits, ' ') + "`) **" + username + "** - ";
+			desc += currency + " " + getServerData(channel.guildId()).currencySymbol + "\n";
+
+			rank += 1;
 		}
-		
+
+		embed.setColor(qrand() % 16777216);
+		embed.setDescription(desc);
+
+		client.createMessage(message.channelId(), embed);
 	});
 
 	RegisterCommand(Commands::CURRENCY_DONATE, "donate", [this](Client& client, const Message& message, const Channel& channel)
@@ -1459,6 +1643,7 @@ void CurrencyModule::OnLoad(const QJsonDocument& doc)
 				(unsigned int) obj[user].toObject()["dailyStreak"].toInt(),
 				(unsigned int) obj[user].toObject()["numberOfDailysClaimed"].toInt(),
 				(unsigned int) obj[user].toObject()["numberOfGiveawaysClaimed"].toInt(),
+				false,
 			};
 
 			list.append(currencyData);
